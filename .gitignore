@@ -18,6 +18,9 @@ env/
 # Models (large binary files — store separately)
 models/*.pkl
 
+echo "data/" >> .gitignore
+echo "*.sqlite" >> .gitignore
+
 # Outputs
 outputs/
 
