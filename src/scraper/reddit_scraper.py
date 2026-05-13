@@ -3,21 +3,26 @@ reddit_scraper.py
 -----------------
 Fetches a Reddit user's comment history using Arctic Shift
 (https://arctic-shift.photon-reddit.com) instead of the Reddit API (PRAW).
-
 """
 
 import time
 import logging
-from typing import Optional
+from typing import Optional, List
+from dataclasses import dataclass
 import requests
 
 logger = logging.getLogger(__name__)
 
 ARCTIC_SHIFT_BASE = "https://arctic-shift.photon-reddit.com/api"
-
-# Fallback: Reddit's own unofficial JSON endpoint (no auth needed)
 REDDIT_JSON_BASE = "https://www.reddit.com/user/{username}/comments.json"
 
+@dataclass
+class ScrapeResult:
+    success: bool
+    comments: list
+    total_kept: int
+    subreddits_seen: list
+    error: Optional[str] = None
 
 class RedditScraper:
     """
@@ -41,14 +46,41 @@ class RedditScraper:
             {"User-Agent": "PersonalityFingerprinter/2.0 (arctic-shift backend)"}
         )
 
-    # ------------------------------------------------------------------
-    # Public interface (same as the original PRAW-based scraper)
-    # ------------------------------------------------------------------
+    # --------------- App-expected interface ---------------
+    def fetch(self, username: str, limit: int = 200) -> ScrapeResult:
+        """
+        Fetch up to *limit* comments for *username*.
+        Returns a ScrapeResult object expected by app.py and other modules.
+        """
+        effective_limit = min(limit, self.max_comments)
+        logger.info("Fetching comments for u/%s via Arctic Shift ...", username)
+        comments = self._fetch_arctic_shift(username, effective_limit)
 
-    def fetch_comments(self, username: str) -> list[dict]:
+        if not comments:
+            logger.warning("Arctic Shift returned 0 comments — trying Reddit JSON fallback.")
+            comments = self._fetch_reddit_json(username, effective_limit)
+
+        if not comments:
+            return ScrapeResult(
+                success=False,
+                comments=[],
+                total_kept=0,
+                subreddits_seen=[],
+                error=f"No public comments found for u/{username}. The account may be private, suspended, or non-existent.",
+            )
+
+        subreddits = sorted({c["subreddit"] for c in comments if c.get("subreddit")})
+        return ScrapeResult(
+            success=True,
+            comments=comments,
+            total_kept=len(comments),
+            subreddits_seen=subreddits,
+        )
+
+    # --------------- Legacy/test interface ---------------
+    def fetch_comments(self, username: str) -> list:
         """
         Return a list of comment dicts for *username*.
-
         Each dict contains at minimum:
             body        : str   – raw comment text
             score       : int   – upvotes
@@ -56,33 +88,25 @@ class RedditScraper:
             created_utc : float – unix timestamp
         """
         logger.info("Fetching comments for u/%s via Arctic Shift …", username)
-        comments = self._fetch_arctic_shift(username)
+        comments = self._fetch_arctic_shift(username, self.max_comments)
 
         if not comments:
             logger.warning(
                 "Arctic Shift returned 0 comments for u/%s – trying Reddit JSON fallback.",
                 username,
             )
-            comments = self._fetch_reddit_json(username)
+            comments = self._fetch_reddit_json(username, self.max_comments)
 
         logger.info("Retrieved %d comments for u/%s.", len(comments), username)
         return comments
 
-    # ------------------------------------------------------------------
-    # Arctic Shift (primary)
-    # ------------------------------------------------------------------
-
-    def _fetch_arctic_shift(self, username: str) -> list[dict]:
-        """
-        Paginate through Arctic Shift's /comments endpoint.
-
-        Docs: https://arctic-shift.photon-reddit.com/api/comments?author=<user>
-        """
-        comments: list[dict] = []
+    # --------------- Arctic Shift (primary) ---------------
+    def _fetch_arctic_shift(self, username: str, limit: int) -> list:
+        comments: list = []
         after: Optional[str] = None
-        page_size = min(100, self.max_comments)  # Arctic Shift max per page = 100
+        page_size = min(100, limit)
 
-        while len(comments) < self.max_comments:
+        while len(comments) < limit:
             params: dict = {
                 "author": username,
                 "limit": page_size,
@@ -101,15 +125,14 @@ class RedditScraper:
 
             comments.extend(self._normalise_arctic(c) for c in page)
 
-            # Pagination: Arctic Shift returns a `after` cursor
+            # Pagination: Arctic Shift returns an `after` cursor
             after = data.get("metadata", {}).get("after")
             if not after:
                 break
 
-            # polite delay
             time.sleep(0.25)
 
-        return comments[: self.max_comments]
+        return comments[:limit]
 
     @staticmethod
     def _normalise_arctic(raw: dict) -> dict:
@@ -124,20 +147,13 @@ class RedditScraper:
             "permalink": raw.get("permalink", ""),
         }
 
-    # ------------------------------------------------------------------
-    # Reddit JSON fallback (no auth, ~1000 comment limit)
-    # ------------------------------------------------------------------
-
-    def _fetch_reddit_json(self, username: str) -> list[dict]:
-        """
-        Use Reddit's public .json endpoint as a fallback.
-        Returns at most ~1000 recent comments (Reddit hard limit).
-        """
-        comments: list[dict] = []
+    # --------------- Reddit JSON fallback ---------------
+    def _fetch_reddit_json(self, username: str, limit: int) -> list:
+        comments: list = []
         after: Optional[str] = None
         url = REDDIT_JSON_BASE.format(username=username)
 
-        while len(comments) < self.max_comments:
+        while len(comments) < limit:
             params: dict = {"limit": 100, "raw_json": 1}
             if after:
                 params["after"] = after
@@ -168,14 +184,11 @@ class RedditScraper:
             if not after:
                 break
 
-            time.sleep(1.0)  # Reddit public endpoint needs a gentle touch
+            time.sleep(1.0)
 
-        return comments[: self.max_comments]
+        return comments[:limit]
 
-    # ------------------------------------------------------------------
-    # Shared HTTP helper with retry logic
-    # ------------------------------------------------------------------
-
+    # --------------- Shared HTTP helper ---------------
     def _get(self, url: str, params: dict) -> Optional[dict]:
         for attempt in range(1, self.retries + 1):
             try:
@@ -196,5 +209,4 @@ class RedditScraper:
             except requests.exceptions.RequestException as exc:
                 logger.error("Request error on attempt %d/%d: %s", attempt, self.retries, exc)
                 time.sleep(1)
-
         return None
