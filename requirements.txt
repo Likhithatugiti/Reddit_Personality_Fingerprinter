@@ -1,14 +1,24 @@
-praw==7.7.1
-spacy==3.7.4
-lightgbm==4.3.0
-scikit-learn==1.4.2
-pandas==2.2.2
-numpy==1.26.4
-vaderSentiment==3.3.2
-textstat==0.7.3
-nrclex==4.0.0
-plotly==5.22.0
-reportlab==4.1.0
-streamlit==1.35.0
-python-dotenv==1.0.1
-pytest==8.2.0
+# ── Web / HTTP ──────────────────────────────────────────────────────────────
+requests>=2.31.0          # replaces praw – used by arctic-shift scraper
+
+# ── NLP ─────────────────────────────────────────────────────────────────────
+spacy>=3.7.0
+vaderSentiment>=3.3.2
+nrclex>=3.0.0             # NRC emotion lexicon
+
+# ── ML ──────────────────────────────────────────────────────────────────────
+lightgbm>=4.3.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+pandas>=2.2.0
+
+# ── App ──────────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+plotly>=5.22.0
+
+# ── Reporting ────────────────────────────────────────────────────────────────
+reportlab>=4.1.0
+
+# ── Dev / test ────────────────────────────────────────────────────────────────
+pytest>=8.0.0
+python-dotenv>=1.0.0
