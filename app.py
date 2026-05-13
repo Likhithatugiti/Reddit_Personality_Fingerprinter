@@ -7,6 +7,8 @@ Run with:
 
 import logging
 import streamlit as st
+import os
+from pathlib import Path
 
 from config import MIN_COMMENTS_REQUIRED, TRAIT_NAMES, TRAITS
 from src.scraper.reddit_scraper import RedditScraper
@@ -27,7 +29,13 @@ st.set_page_config(
 # ── Cached resource loaders ───────────────────────────────────────────────────
 @st.cache_resource
 def get_scraper():
-    return RedditScraper()
+    db_path = Path("data/database.sqlite")
+    if db_path.exists():
+        from src.scraper.dataset_loader import DatasetLoader
+        return DatasetLoader(str(db_path))
+    else:
+        from src.scraper.reddit_scraper import RedditScraper
+        return RedditScraper()
 
 @st.cache_resource
 def get_predictor():
