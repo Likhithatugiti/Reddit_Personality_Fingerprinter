@@ -1,132 +1,200 @@
 """
-src/scraper/reddit_scraper.py
+reddit_scraper.py
+-----------------
+Fetches a Reddit user's comment history using Arctic Shift
+(https://arctic-shift.photon-reddit.com) instead of the Reddit API (PRAW).
 
-Fetches a Reddit user's public comment history using PRAW.
-Returns a cleaned list of comment strings.
 """
 
+import time
 import logging
-from dataclasses import dataclass, field
-from typing import List, Optional
-
-import praw
-from praw.exceptions import PRAWException
-
-from config import (
-    REDDIT_CLIENT_ID,
-    REDDIT_CLIENT_SECRET,
-    REDDIT_USER_AGENT,
-    COMMENT_LIMIT,
-    MIN_COMMENT_LENGTH,
-    SUBREDDITS_BLACKLIST,
-)
+from typing import Optional
+import requests
 
 logger = logging.getLogger(__name__)
 
+ARCTIC_SHIFT_BASE = "https://arctic-shift.photon-reddit.com/api"
 
-@dataclass
-class ScrapeResult:
-    username: str
-    comments: List[str] = field(default_factory=list)
-    total_fetched: int = 0
-    total_kept: int = 0
-    subreddits_seen: List[str] = field(default_factory=list)
-    error: Optional[str] = None
-
-    @property
-    def success(self) -> bool:
-        return self.error is None and len(self.comments) > 0
-
-    @property
-    def word_count(self) -> int:
-        return sum(len(c.split()) for c in self.comments)
+# Fallback: Reddit's own unofficial JSON endpoint (no auth needed)
+REDDIT_JSON_BASE = "https://www.reddit.com/user/{username}/comments.json"
 
 
 class RedditScraper:
     """
-    Wraps PRAW to fetch and filter comments for a given username.
+    Fetches public comment history for a Reddit user.
 
-    Usage
-    -----
-    scraper = RedditScraper()
-    result  = scraper.fetch("spez", limit=300)
-    print(result.comments[:3])
+    Primary source  : Arctic Shift API (deep archive, no credentials)
+    Fallback source : Reddit JSON endpoint (recent ~1000 comments)
     """
 
-    def __init__(self):
-        self._reddit = praw.Reddit(
-            client_id=REDDIT_CLIENT_ID,
-            client_secret=REDDIT_CLIENT_SECRET,
-            user_agent=REDDIT_USER_AGENT,
-            # read-only; no login needed
+    def __init__(
+        self,
+        max_comments: int = 500,
+        request_timeout: int = 15,
+        retry_attempts: int = 3,
+    ):
+        self.max_comments = max_comments
+        self.timeout = request_timeout
+        self.retries = retry_attempts
+        self.session = requests.Session()
+        self.session.headers.update(
+            {"User-Agent": "PersonalityFingerprinter/2.0 (arctic-shift backend)"}
         )
-        logger.info("PRAW client initialised (read-only mode)")
 
-    # ── Public API ─────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Public interface (same as the original PRAW-based scraper)
+    # ------------------------------------------------------------------
 
-    def fetch(self, username: str, limit: int = COMMENT_LIMIT) -> ScrapeResult:
+    def fetch_comments(self, username: str) -> list[dict]:
         """
-        Fetch up to `limit` comments for `username`.
+        Return a list of comment dicts for *username*.
 
-        Parameters
-        ----------
-        username : str
-            Reddit username (without u/)
-        limit : int
-            Maximum number of comments to request from the API.
-            PRAW caps at 1000.
-
-        Returns
-        -------
-        ScrapeResult
+        Each dict contains at minimum:
+            body        : str   – raw comment text
+            score       : int   – upvotes
+            subreddit   : str   – subreddit name
+            created_utc : float – unix timestamp
         """
-        result = ScrapeResult(username=username)
+        logger.info("Fetching comments for u/%s via Arctic Shift …", username)
+        comments = self._fetch_arctic_shift(username)
 
-        try:
-            redditor = self._reddit.redditor(username)
-            comments_raw = list(redditor.comments.new(limit=limit))
-        except PRAWException as exc:
-            result.error = f"PRAW error: {exc}"
-            logger.error(result.error)
-            return result
-        except Exception as exc:
-            result.error = f"Unexpected error: {exc}"
-            logger.error(result.error)
-            return result
+        if not comments:
+            logger.warning(
+                "Arctic Shift returned 0 comments for u/%s – trying Reddit JSON fallback.",
+                username,
+            )
+            comments = self._fetch_reddit_json(username)
 
-        result.total_fetched = len(comments_raw)
-        seen_subreddits = set()
+        logger.info("Retrieved %d comments for u/%s.", len(comments), username)
+        return comments
 
-        for comment in comments_raw:
-            # Skip deleted/bot content
-            author = getattr(comment, "author", None)
-            if author is None or str(author) in SUBREDDITS_BLACKLIST:
-                continue
+    # ------------------------------------------------------------------
+    # Arctic Shift (primary)
+    # ------------------------------------------------------------------
 
-            body = comment.body.strip()
-            subreddit = str(comment.subreddit)
+    def _fetch_arctic_shift(self, username: str) -> list[dict]:
+        """
+        Paginate through Arctic Shift's /comments endpoint.
 
-            # Basic quality filter
-            if len(body) < MIN_COMMENT_LENGTH:
-                continue
-            if body in ("[deleted]", "[removed]"):
-                continue
+        Docs: https://arctic-shift.photon-reddit.com/api/comments?author=<user>
+        """
+        comments: list[dict] = []
+        after: Optional[str] = None
+        page_size = min(100, self.max_comments)  # Arctic Shift max per page = 100
 
-            result.comments.append(body)
-            seen_subreddits.add(subreddit)
+        while len(comments) < self.max_comments:
+            params: dict = {
+                "author": username,
+                "limit": page_size,
+                "sort": "desc",
+            }
+            if after:
+                params["after"] = after
 
-        result.total_kept = len(result.comments)
-        result.subreddits_seen = sorted(seen_subreddits)
+            data = self._get(f"{ARCTIC_SHIFT_BASE}/comments", params)
+            if data is None:
+                break
 
-        logger.info(
-            "Fetched %d comments for u/%s, kept %d after filtering",
-            result.total_fetched, username, result.total_kept,
-        )
-        return result
+            page = data.get("data", [])
+            if not page:
+                break  # exhausted
 
-    # ── Helpers ────────────────────────────────────────────────────────────
+            comments.extend(self._normalise_arctic(c) for c in page)
+
+            # Pagination: Arctic Shift returns a `after` cursor
+            after = data.get("metadata", {}).get("after")
+            if not after:
+                break
+
+            # polite delay
+            time.sleep(0.25)
+
+        return comments[: self.max_comments]
 
     @staticmethod
-    def merge_comments(comments: List[str], separator: str = " ") -> str:
-        """Concatenate all comments into a single string for bulk NLP."""
-        return separator.join(comments)
+    def _normalise_arctic(raw: dict) -> dict:
+        """Map Arctic Shift field names to our internal schema."""
+        return {
+            "body": raw.get("body", ""),
+            "score": int(raw.get("score", 0)),
+            "subreddit": raw.get("subreddit", ""),
+            "created_utc": float(raw.get("created_utc", 0)),
+            "id": raw.get("id", ""),
+            "link_id": raw.get("link_id", ""),
+            "permalink": raw.get("permalink", ""),
+        }
+
+    # ------------------------------------------------------------------
+    # Reddit JSON fallback (no auth, ~1000 comment limit)
+    # ------------------------------------------------------------------
+
+    def _fetch_reddit_json(self, username: str) -> list[dict]:
+        """
+        Use Reddit's public .json endpoint as a fallback.
+        Returns at most ~1000 recent comments (Reddit hard limit).
+        """
+        comments: list[dict] = []
+        after: Optional[str] = None
+        url = REDDIT_JSON_BASE.format(username=username)
+
+        while len(comments) < self.max_comments:
+            params: dict = {"limit": 100, "raw_json": 1}
+            if after:
+                params["after"] = after
+
+            data = self._get(url, params)
+            if data is None:
+                break
+
+            children = data.get("data", {}).get("children", [])
+            if not children:
+                break
+
+            for child in children:
+                c = child.get("data", {})
+                comments.append(
+                    {
+                        "body": c.get("body", ""),
+                        "score": int(c.get("score", 0)),
+                        "subreddit": c.get("subreddit", ""),
+                        "created_utc": float(c.get("created_utc", 0)),
+                        "id": c.get("id", ""),
+                        "link_id": c.get("link_id", ""),
+                        "permalink": "https://reddit.com" + c.get("permalink", ""),
+                    }
+                )
+
+            after = data.get("data", {}).get("after")
+            if not after:
+                break
+
+            time.sleep(1.0)  # Reddit public endpoint needs a gentle touch
+
+        return comments[: self.max_comments]
+
+    # ------------------------------------------------------------------
+    # Shared HTTP helper with retry logic
+    # ------------------------------------------------------------------
+
+    def _get(self, url: str, params: dict) -> Optional[dict]:
+        for attempt in range(1, self.retries + 1):
+            try:
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response else "?"
+                if status == 404:
+                    logger.warning("User not found (404). Stopping.")
+                    return None
+                if status == 429:
+                    wait = 2 ** attempt
+                    logger.warning("Rate limited. Waiting %ds …", wait)
+                    time.sleep(wait)
+                else:
+                    logger.error("HTTP %s on attempt %d/%d", status, attempt, self.retries)
+            except requests.exceptions.RequestException as exc:
+                logger.error("Request error on attempt %d/%d: %s", attempt, self.retries, exc)
+                time.sleep(1)
+
+        return None
